@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""
+two_agent_tinder.py
+Refactored from the original 'tinder.py' into a clean, reusable two-agent chat runner.
+
+Key improvements:
+- Proper loop for N turns (configurable).
+- Provider abstraction (OpenAI-compatible endpoints like Groq/Gemini).
+- Safer, clearer prompts and roles; Portuguese context preserved.
+- Deterministic "stub" fallback if API keys are missing (so you can test offline).
+- Single source of truth for history; pretty transcript output.
+- Type hints, dataclasses, basic retry/error handling.
+"""
+
+from __future__ import annotations
+import os
+import time
+import random
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=True)
+except Exception:
+    # dotenv is optional
+    pass
+
+try:
+    # One client for “OpenAI-compatible” endpoints (Groq, Google Gemini OpenAI wrapper, etc.)
+    from openai import OpenAI
+    HAS_OPENAI = True
+except Exception:
+    HAS_OPENAI = False
+
+
+# ----------------------------
+# Config
+# ----------------------------
+
+@dataclass
+class AgentConfig:
+    name: str
+    system_preamble: str
+    provider_name: str
+    model: str
+    base_url: Optional[str] = None
+    api_key_env: Optional[str] = None
+    temperature: float = 0.7
+    max_tokens: int = 400
+
+
+@dataclass
+class RunConfig:
+    total_messages: int = 50  # e.g., 10 per agent
+    turn_delay_s: float = 0.0  # no delay by default
+    seed: int = 42  # for stub mode reproducibility
+
+
+# ----------------------------
+# Providers
+# ----------------------------
+
+class LLMProvider:
+    """Abstracts an OpenAI-compatible chat.completions.create API.
+    If the required API key/client is missing, falls back to a stub responder.
+    """
+
+    def __init__(self, cfg: AgentConfig):
+        self.cfg = cfg
+        self._client = None
+        self._enabled = False
+
+        api_key = os.getenv(cfg.api_key_env) if cfg.api_key_env else None
+        if HAS_OPENAI and api_key and cfg.base_url:
+            try:
+                self._client = OpenAI(api_key=api_key, base_url=cfg.base_url)
+                self._enabled = True
+            except Exception:
+                self._enabled = False
+
+        elif HAS_OPENAI and api_key and not cfg.base_url:
+            try:
+                self._client = OpenAI(api_key=api_key)
+                self._enabled = True
+            except Exception:
+                self._enabled = False
+        else:
+            self._enabled = False
+
+    def generate(self, messages: List[Dict[str, str]]) -> str:
+        """Return the assistant text. Falls back to stub if provider is disabled."""
+        if self._enabled and self._client:
+            # OpenAI-compatible call
+            try:
+                resp = self._client.chat.completions.create(
+                    model=self.cfg.model,
+                    messages=messages,
+                    temperature=self.cfg.temperature,
+                    max_tokens=self.cfg.max_tokens,
+                )
+                # Newer OpenAI-compatible libs expose message content at this path:
+                return resp.choices[0].message.content.strip()
+            except Exception as e:
+                # Fallback to stub on failure
+                return self._stub_response(messages, note=f"(provider error: {e})")
+        else:
+            return self._stub_response(messages, note="(stub mode)")
+
+    def _stub_response(self, messages: List[Dict[str, str]], note: str = "") -> str:
+        """Deterministic, lightweight fallback so you can test without keys."""
+        # Very simple context-aware reply generator
+        text = messages[-1]["content"] if messages else ""
+        random.seed(self.cfg.name + str(len(messages)))
+        pivots = [
+            "😄", "😉", "✨", "👍", "👀", "🎯", "🌊", "☕", "🎶", "📍",
+            "🧩", "🏃", "🎒", "🗺️", "🌞", "🌙"
+        ]
+        vibe = random.choice(pivots)
+        # Keep it short/flirty, Portugal setting
+        templates = [
+            f"{vibe} Gosto da tua energia. Conta-me uma coisa inesperada sobre ti.",
+            f"{vibe} Hm, isso soa a desafio. Onde levarias alguém num primeiro encontro em Portugal?",
+            f"{vibe} Estou a sorrir desse lado. Praia ao pôr-do-sol ou petiscos num tasco?",
+            f"{vibe} Boa! E no fim-de-semana, és mais trilhos na serra ou brunch na cidade?",
+            f"{vibe} Faz sentido. Qual foi a melhor surpresa do teu ano até agora?"
+        ]
+        # Pick by the last char to be stable-ish
+        idx = abs(hash(text)) % len(templates)
+        out = templates[idx]
+        if note:
+            out += f" {note}"
+        return out
+
+
+# ----------------------------
+# Conversation Orchestrator
+# ----------------------------
+
+class TwoAgentConversation:
+    def __init__(self, agent_a: AgentConfig, agent_b: AgentConfig, run_cfg: RunConfig):
+        self.a = agent_a
+        self.b = agent_b
+        self.run_cfg = run_cfg
+
+        random.seed(run_cfg.seed)
+
+        self.provider_a = LLMProvider(agent_a)
+        self.provider_b = LLMProvider(agent_b)
+
+        # Start history with the two system messages
+        self.history: List[Dict[str, str]] = [
+            {"role": "system", "content": self.a.system_preamble},
+            {"role": "system", "content": self.b.system_preamble},
+        ]
+
+    def _build_messages_for(self, speaker: AgentConfig) -> List[Dict[str, str]]:
+        """Return messages including the speaker's system prompt for context."""
+        # Always re-inject the speaking agent's system preamble
+        base = [{"role": "system", "content": speaker.system_preamble}]
+        # Then the shared dialogue so far
+        for m in self.history:
+            if m["role"] != "system":
+                base.append(m)
+        return base
+
+    def _append_user_msg(self, who: str, content: str):
+        self.history.append({"role": "user", "content": f"{who}: {content}"})
+
+    def _append_assistant_msg(self, who: str, content: str):
+        self.history.append({"role": "assistant", "content": f"{who}: {content}"})
+
+    def run(self) -> List[str]:
+        """Run the conversation and return a clean transcript list (without roles)."""
+        transcript: List[str] = []
+
+        # Seed openers
+        opener_a = "Olá! Gostei do teu perfil — foto na Serra da Estrela ganhou-me. Como foi essa caminhada? 🙂"
+        self._append_assistant_msg(self.a.name, opener_a)
+        transcript.append(f"{self.a.name}: {opener_a}")
+
+        # Alternate speakers for total_messages - 1 (we already posted one)
+        for turn in range(1, self.run_cfg.total_messages):
+            is_b_turn = (turn % 2 == 1)
+            speaker = self.b if is_b_turn else self.a
+            provider = self.provider_b if is_b_turn else self.provider_a
+
+            messages = self._build_messages_for(speaker)
+            reply = provider.generate(messages)
+
+            self._append_assistant_msg(speaker.name, reply)
+            transcript.append(f"{speaker.name}: {reply}")
+
+            if self.run_cfg.turn_delay_s > 0:
+                time.sleep(self.run_cfg.turn_delay_s)
+
+        return transcript
+
+    def pretty_print(self, transcript: List[str]):
+        bar = "—" * 72
+        print(bar)
+        print("Two-Agent Tinder Conversation")
+        print(bar)
+        for line in transcript:
+            print(line)
+        print(bar)
+
+
+# ----------------------------
+# Example usage
+# ----------------------------
+
+def main():
+    # Agent A: 40-year-old Portuguese man
+    agent_a = AgentConfig(
+        name="Homem (40)",
+        system_preamble=(
+            "You are a 40-year-old Portuguese man chatting on Tinder. "
+            "Be warm, playful, and respectful; short messages; mild flirt; European Portuguese."
+        ),
+        provider_name="Gemini-OpenAI",
+        model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+        base_url=os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"),
+        api_key_env=os.getenv("GEMINI_API_KEY_ENV", "GOOGLE_API_KEY"),
+        temperature=0.8,
+        max_tokens=300,
+    )
+
+    # Agent B: 35-year-old Portuguese woman
+    agent_b = AgentConfig(
+        name="Mulher (35)",
+        system_preamble=(
+            "You are a 35-year-old Portuguese woman chatting on Tinder. "
+            "Be witty, curious, lightly teasing; short messages; European Portuguese."
+        ),
+        provider_name="Groq",
+        model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        base_url=os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
+        api_key_env=os.getenv("GROQ_API_KEY_ENV", "GROQ_API_KEY"),
+        temperature=0.8,
+        max_tokens=300,
+    )
+
+    run_cfg = RunConfig(total_messages=int(os.getenv("TOTAL_MESSAGES", "20")), turn_delay_s=0.0)
+
+    convo = TwoAgentConversation(agent_a, agent_b, run_cfg)
+    transcript = convo.run()
+    convo.pretty_print(transcript)
+
+
+if __name__ == "__main__":
+    main()

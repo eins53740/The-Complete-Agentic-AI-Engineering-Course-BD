@@ -1,0 +1,1 @@
+# Do Match ao Cappuccino: Um Diálogo\n\n_pt‑PT_\n\n> Transcript gerado em 2025-09-13 23:13\n\n---\n\n**Homem (40)**: Olá! Curti o teu perfil — que tal começarmos por um café com bolo decente? 🙂\n\n**Mulher (35)**: Quinta às 19:00 funciona para mim. Combinado? (stub)\n\n
