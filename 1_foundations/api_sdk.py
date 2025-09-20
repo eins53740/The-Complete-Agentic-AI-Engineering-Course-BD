@@ -37,11 +37,15 @@ groq = OpenAI(api_key=groq_api_key, base_url="https://api.groq.com/openai/v1")
 response = groq.chat.completions.create(model=model_name, messages=messages)
 answer = response.choices[0].message.content
 
+
+
 from strands import Agent
 from strands_tools import calculator
 agent = Agent(tools=[calculator])
 agent("What is the square root of 1764")
 
+### pip install strands-agents
+### python -u agent.py
 from strands import Agent
 # Create an agent with default settings
 agent = Agent()
