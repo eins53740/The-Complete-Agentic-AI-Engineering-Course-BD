@@ -2,27 +2,29 @@
 # -*- coding: utf-8 -*-
 """
 two_agent_tinder_v2.py
-Adds:
-- max 50 messages (configurable).
-- stop when a physical meeting is combined (simple regex heuristics).
-- export to Markdown in a "book dialog" style.
+Two-agent Tinder style conversation orchestrated via LLM-compatible chat APIs.
+- Alternating agents with configurable OpenAI-compatible endpoints.
+- Stops when a meeting is agreed (simple regex heuristics) or max turns reached.
+- Optionally prints and exports the transcript as Markdown.
 """
 
 import os
 import re
 import time
 from dataclasses import dataclass
-from typing import List, Dict, Optional
 from datetime import datetime
+from typing import Dict, List, Optional
 
 try:
     from dotenv import load_dotenv
+
     load_dotenv(override=True)
 except Exception:
     pass
 
 try:
     from openai import OpenAI
+
     HAS_OPENAI = True
 except Exception:
     HAS_OPENAI = False
@@ -32,9 +34,11 @@ MEETING_PATTERNS = [
     r"\b(hoje|amanhã|segunda|terça|terça-feira|quarta|quinta|quinta-feira|sexta|sábado|domingo)\b",
     r"\bàs?\s*\d{1,2}[:h]\d{0,2}\b",
     r"\b19:00|18:30|20:00|17:30\b",
-    r"\bfunciona|pode ser|combinado|feito|perfeito|fechado\b"
+    r"\bfunciona|pode ser|combinado|feito|perfeito|fechado\b",
 ]
 MEETING_RE = re.compile("|".join(MEETING_PATTERNS), flags=re.IGNORECASE)
+ACCEPTANCE_RE = re.compile(r"\b(combinado|feito|perfeito|fechado|ok)\b", flags=re.IGNORECASE)
+
 
 @dataclass
 class AgentConfig:
@@ -45,11 +49,21 @@ class AgentConfig:
     api_key_env: Optional[str] = None
     temperature: float = 0.7
     max_tokens: int = 400
+    initial_prompt: Optional[str] = None
+
 
 @dataclass
 class RunConfig:
     max_messages: int = 50
     turn_delay_s: float = 0.0
+    print_transcript: bool = True
+
+
+@dataclass
+class ConversationTurn:
+    speaker: str
+    text: str
+
 
 class Provider:
     def __init__(self, cfg: AgentConfig):
@@ -67,7 +81,7 @@ class Provider:
             except Exception:
                 self._enabled = False
 
-    def generate(self, messages: List[Dict[str,str]]) -> str:
+    def generate(self, messages: List[Dict[str, str]]) -> str:
         if self._enabled and self._client:
             try:
                 resp = self._client.chat.completions.create(
@@ -76,103 +90,131 @@ class Provider:
                     temperature=self.cfg.temperature,
                     max_tokens=self.cfg.max_tokens,
                 )
-                return resp.choices[0].message.content.strip()
-            except Exception as e:
-                return self._stub(messages, f"(provider error: {e})")
-        return self._stub(messages, "(stub)")
+                content = resp.choices[0].message.content if resp.choices else ""
+                return (content or "").strip()
+            except Exception as exc:
+                return self._stub(messages, f"(provider error: {exc})")
+        return self._stub(messages, "(provider unavailable)")
 
-    def _stub(self, messages: List[Dict[str,str]], note:str="") -> str:
-        # A tiny, deterministic-ish fallback
-        last = ""
-        for m in reversed(messages):
-            if m["role"] in ("user","assistant"):
-                last = m["content"]; break
-        if "café" in last.lower() or "encontro" in last.lower():
-            s = "Quinta às 19:00 funciona para mim. Combinado?"
+    def _stub(self, messages: List[Dict[str, str]], note: str = "") -> str:
+        last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+        if MEETING_RE.search(last_user):
+            suggestion = "Vamos combinar um café quinta às 19:00?"
         else:
-            s = "Gosto da ideia. Preferes conversa calma num café ou passeio curto à beira-rio?"
-        return s + (f" {note}" if note else "")
+            suggestion = "Adoro a energia. Que tal marcarmos algo leve para nos conhecermos?"
+        return f"{suggestion} {note}".strip()
 
-def meeting_agreed(history: List[str]) -> bool:
-    if len(history) < 2:
+
+def meeting_agreed(turns: List[ConversationTurn]) -> bool:
+    if len(turns) < 2:
         return False
-    last = history[-1]
-    prev = history[-2]
-    intent = bool(MEETING_RE.search(prev))
-    accept = bool(re.search(r"\\b(combinado|feito|perfeito|fechado|ok)\\b", last, flags=re.IGNORECASE)) or bool(MEETING_RE.search(last))
-    return intent and accept
+    previous = turns[-2].text
+    latest = turns[-1].text
+    intent = bool(MEETING_RE.search(previous))
+    acceptance = bool(ACCEPTANCE_RE.search(latest)) or bool(MEETING_RE.search(latest))
+    return intent and acceptance
+
 
 class TwoAgentChat:
-    def __init__(self, a: AgentConfig, b: AgentConfig, run: RunConfig):
-        self.a, self.b, self.run = a, b, run
-        self.pa, self.pb = Provider(a), Provider(b)
-        self.history: List[Dict[str,str]] = [
-            {"role":"system","content":a.system_preamble},
-            {"role":"system","content":b.system_preamble},
+    def __init__(self, agent_a: AgentConfig, agent_b: AgentConfig, run: RunConfig):
+        self.agents = (agent_a, agent_b)
+        self.run = run
+        self.providers = {
+            agent_a.name: Provider(agent_a),
+            agent_b.name: Provider(agent_b),
+        }
+        self.turns: List[ConversationTurn] = []
+
+    def build_messages_for(self, speaker: AgentConfig) -> List[Dict[str, str]]:
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": speaker.system_preamble}
         ]
-        self.transcript: List[str] = []
+        if not self.turns:
+            kickoff = speaker.initial_prompt or "Inicia a conversa com uma abertura natural e descontraída."
+            messages.append({"role": "user", "content": kickoff})
+            return messages
+        for turn in self.turns:
+            role = "assistant" if turn.speaker == speaker.name else "user"
+            messages.append({"role": role, "content": turn.text})
+        return messages
 
-    def say(self, who:str, text:str, role:str="assistant"):
-        self.history.append({"role": role, "content": f"{who}: {text}"})
-        self.transcript.append(f"{who}: {text}")
+    def append_turn(self, speaker: AgentConfig, text: str) -> None:
+        cleaned = text.strip()
+        self.turns.append(ConversationTurn(speaker=speaker.name, text=cleaned))
+        if self.run.print_transcript:
+            print(f"{speaker.name}: {cleaned}")
 
-    def build_messages_for(self, speaker: AgentConfig) -> List[Dict[str,str]]:
-        msgs = [{"role":"system","content":speaker.system_preamble}]
-        for m in self.history:
-            if m["role"] != "system":
-                msgs.append(m)
-        return msgs
-
-    def run_until_meeting_or_max(self):
-        # opener by A
-        self.say(self.a.name, "Olá! Curti o teu perfil — que tal começarmos por um café com bolo decente? 🙂")
-        turn = 1
-        while turn < self.run.max_messages and not meeting_agreed(self.transcript):
-            # B
-            msgs = self.build_messages_for(self.b)
-            reply_b = self.pb.generate(msgs)
-            self.say(self.b.name, reply_b)
-            if meeting_agreed(self.transcript) or len(self.transcript) >= self.run.max_messages:
+    def run_until_meeting_or_max(self) -> None:
+        current_index = 0
+        turns_taken = 0
+        while turns_taken < self.run.max_messages:
+            agent = self.agents[current_index]
+            provider = self.providers[agent.name]
+            prompt_messages = self.build_messages_for(agent)
+            reply = provider.generate(prompt_messages) or ""
+            self.append_turn(agent, reply or "...")
+            turns_taken += 1
+            if meeting_agreed(self.turns):
                 break
-            # A
-            msgs = self.build_messages_for(self.a)
-            reply_a = self.pa.generate(msgs)
-            self.say(self.a.name, reply_a)
-            if self.run.turn_delay_s > 0: time.sleep(self.run.turn_delay_s)
-            turn += 2
+            if self.run.turn_delay_s > 0:
+                time.sleep(self.run.turn_delay_s)
+            current_index = 1 - current_index
 
-    def export_markdown(self, path:str, title:str, subtitle:Optional[str]=None):
+    def export_markdown(self, path: str, title: str, subtitle: Optional[str] = None) -> None:
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(f"# {title}\\n\\n")
-            if subtitle: f.write(f"_{subtitle}_\\n\\n")
-            f.write(f"> Transcript gerado em {now}\\n\\n---\\n\\n")
-            for line in self.transcript:
-                who, text = line.split(":",1)
-                f.write(f"**{who.strip()}**: {text.strip()}\\n\\n")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(f"# {title}\n\n")
+            if subtitle:
+                handle.write(f"_{subtitle}_\n\n")
+            handle.write(f"> Transcript gerado em {now}\n\n---\n\n")
+            for turn in self.turns:
+                handle.write(f"**{turn.speaker}**: {turn.text.strip()}\n\n")
 
-def main():
-    a = AgentConfig(
+
+def main() -> None:
+    agent_a = AgentConfig(
         name="Homem (40)",
-        system_preamble="Portuguese man, 40, friendly, playful, short messages, pt-PT.",
-        model=os.getenv("MODEL_A","small-model"),
-        base_url=os.getenv("BASE_URL_A",""),
-        api_key_env=os.getenv("API_KEY_ENV_A",""),
-        temperature=0.8, max_tokens=300
+        system_preamble=(
+            "You are a playful Portuguese man in his 40s chatting on Tinder. "
+            "Keep replies in pt-PT, warm, confident, concise, and always push the "
+            "interaction forward while staying respectful."
+        ),
+        model=os.getenv("MODEL_A", "small-model"),
+        base_url=os.getenv("BASE_URL_A") or None,
+        api_key_env=os.getenv("API_KEY_ENV_A") or "OPENAI_API_KEY",
+        temperature=float(os.getenv("TEMP_A", "0.8")),
+        max_tokens=int(os.getenv("TOKENS_A", "300")),
+        initial_prompt=(
+            "Estás prestes a enviar a primeira mensagem à tua match. Cria uma abertura "
+            "leve, divertida e específica o suficiente para parecer autêntica."
+        ),
     )
-    b = AgentConfig(
+    agent_b = AgentConfig(
         name="Mulher (35)",
-        system_preamble="Portuguese woman, 35, witty, curious, short messages, pt-PT.",
-        model=os.getenv("MODEL_B","small-model"),
-        base_url=os.getenv("BASE_URL_B",""),
-        api_key_env=os.getenv("API_KEY_ENV_B",""),
-        temperature=0.8, max_tokens=300
+        system_preamble=(
+            "You are a witty Portuguese woman in her mid-30s replying on Tinder. "
+            "Responde em pt-PT de forma curiosa, divertida e com mensagens curtas."
+        ),
+        model=os.getenv("MODEL_B", "small-model"),
+        base_url=os.getenv("BASE_URL_B") or None,
+        api_key_env=os.getenv("API_KEY_ENV_B") or "OPENAI_API_KEY",
+        temperature=float(os.getenv("TEMP_B", "0.8")),
+        max_tokens=int(os.getenv("TOKENS_B", "300")),
     )
-    run = RunConfig(max_messages=int(os.getenv("MAX_MESSAGES","50")), turn_delay_s=0.0)
-    chat = TwoAgentChat(a,b,run)
+    run = RunConfig(
+        max_messages=int(os.getenv("MAX_MESSAGES", "50")),
+        turn_delay_s=float(os.getenv("TURN_DELAY_S", "0")),
+        print_transcript=os.getenv("PRINT_TRANSCRIPT", "1") not in {"0", "false", "False"},
+    )
+    chat = TwoAgentChat(agent_a, agent_b, run)
     chat.run_until_meeting_or_max()
-    out = os.getenv("OUT_MD","tinder_conversation.md")
-    chat.export_markdown(out, title="Do Match ao Cappuccino: Um Diálogo", subtitle="pt‑PT")
+    output_path = os.getenv("OUT_MD", "tinder_conversation.md")
+    chat.export_markdown(
+        output_path,
+        title="Do Match ao Cappuccino: Um Diálogo",
+        subtitle="pt-PT",
+    )
+
 
 if __name__ == "__main__":
     main()
